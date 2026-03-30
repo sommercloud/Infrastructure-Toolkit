@@ -1,0 +1,25 @@
+# VS Code
+.vscode/
+
+# PowerShell Editor Services
+.history/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+TestResults/
+coverage/
+
+# PowerShell module build output
+output/
+build/
+dist/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
