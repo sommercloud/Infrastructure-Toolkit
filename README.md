@@ -1,4 +1,4 @@
-# IT Skript Sammlung
+# IT-Infrastruktur Skript Sammlung
 
 Über die letzten Jahre hat sich bei mir eine Vielzahl an Skripten, Snippets und Quick Fixes angesammelt  
 aus echten Projekten in Bereichen wie:
