@@ -45,9 +45,10 @@
 
 .NOTES
     Author      : Peter Sommer
-    Version     : 1.0.2
+    Version     : 1.0.3
     Created     : 2026-03-25
     Changed     : 2026-03-30 - Added -PowerOff parameter to enable node shutdown after cluster shutdown
+                  2026-09-29 - VM shutdown is now sent to all VMs in parallel (per node background jobs), Stop-VM uses -Force
     Prerequisites: Administrative privileges, Failover Clustering tools.
 #>
 
@@ -107,27 +108,24 @@ try {
         Write-Host "Force mode enabled - bypassing safety prompt." -ForegroundColor Yellow
     }
 
-    # Gracefully shut down all running virtual machines
-    Write-Verbose "Shutting down virtual machines gracefully..."
+    # Gracefully shut down all running virtual machines in parallel
+    # One background job per owner node; on each node every VM gets its own Stop-VM job,
+    # so all guests receive the shutdown request at the same time
+    Write-Verbose "Shutting down virtual machines gracefully (parallel)..."
     $vmGroups = Get-ClusterGroup -Cluster $clusterName | Where-Object { $_.GroupType -eq "VirtualMachine" }
-    foreach ($vmGroup in $vmGroups) {
-        try {
-            if ($vmGroup.State -eq "Online") {
-                $vmName = $vmGroup.Name
-                $ownerNode = $vmGroup.OwnerNode.Name
-
-                Invoke-Command -ComputerName $ownerNode -ScriptBlock {
-                    param($Name)
-                    # Stop-VM without -TurnOff requests a clean guest shutdown.
-                    Stop-VM -Name $Name -Confirm:$false -ErrorAction Stop
-                } -ArgumentList $vmName -ErrorAction Stop
-
-                Write-Verbose "Shutdown command sent to VM '$vmName' on node '$ownerNode'."
-            }
-        }
-        catch {
-            Write-Host "Warning: Failed to send graceful shutdown to VM '$($vmGroup.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+    $vmsByNode = $vmGroups | Where-Object { $_.State -eq "Online" } | Group-Object { $_.OwnerNode.Name }
+    $shutdownJobs = foreach ($nodeGroup in $vmsByNode) {
+        $vmNames = [string[]]$nodeGroup.Group.Name
+        Invoke-Command -ComputerName $nodeGroup.Name -AsJob -JobName "VMShutdown_$($nodeGroup.Name)" -ScriptBlock {
+            param([string[]]$Names)
+            # Stop-VM without -TurnOff requests a clean guest shutdown.
+            # -Force avoids the confirmation prompt for locked guests (not answerable remotely);
+            # the guest then has 5 minutes to save data before it is shut down.
+            $jobs = foreach ($name in $Names) { Stop-VM -Name $name -Force -Confirm:$false -AsJob }
+            # Keep the remote session alive until all guests are off, then surface errors
+            $jobs | Wait-Job | Receive-Job
+        } -ArgumentList (, $vmNames)
+        Write-Verbose "Shutdown command sent to VMs on node '$($nodeGroup.Name)': $($vmNames -join ', ')"
     }
 
     # Wait for all virtual machines to shut down completely
@@ -152,7 +150,17 @@ try {
             Write-Verbose "Still waiting for VMs to shut down: $($vmStatus -join ', ') ($($stopwatch.Elapsed.Minutes)m $($stopwatch.Elapsed.Seconds)s elapsed)"
             Start-Sleep -Seconds 10
         }
-        
+
+        # Report errors from the shutdown jobs (e.g. node unreachable, VM refused shutdown) and clean up
+        foreach ($job in $shutdownJobs) {
+            $jobErrors = $null
+            Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable jobErrors | Out-Null
+            foreach ($err in $jobErrors) {
+                Write-Host "Warning: VM shutdown on node '$($job.Location)' reported an error: $($err.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        $shutdownJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+
         # Handle timeout - abort if not using -Force, otherwise warn and continue
         if ($stopwatch.Elapsed -ge $timeout) {
             $runningVMs = Get-ClusterGroup -Cluster $clusterName |
